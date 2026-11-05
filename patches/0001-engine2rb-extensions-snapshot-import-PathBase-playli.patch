@@ -1,0 +1,558 @@
+From e95ec3906ff4c1e1c7650c72a518320f0a16a0a0 Mon Sep 17 00:00:00 2001
+From: engine2rb <dev@example.com>
+Date: Thu, 5 Nov 2026 22:32:29 +0000
+Subject: [PATCH 1/2] engine2rb extensions: snapshot import, PathBase, playlist
+ filtering, dedupe, fixes
+
+---
+ engine/engine.go        |   5 ++
+ engine/importConvert.go |  14 +++-
+ engine/importExtract.go |   8 +++
+ engine/snapshot.go      | 139 ++++++++++++++++++++++++++++++++++++++++
+ engine/snapshot_test.go |  46 +++++++++++++
+ lib/filter.go           |  89 +++++++++++++++++++++++++
+ lib/filter_test.go      |  71 ++++++++++++++++++++
+ lib/library.go          |  14 ++--
+ rbxml/exportConvert.go  |   5 ++
+ rbxml/uri_test.go       |  21 ++++++
+ 10 files changed, 404 insertions(+), 8 deletions(-)
+ create mode 100644 engine/snapshot.go
+ create mode 100644 engine/snapshot_test.go
+ create mode 100644 lib/filter.go
+ create mode 100644 lib/filter_test.go
+ create mode 100644 rbxml/uri_test.go
+
+diff --git a/engine/engine.go b/engine/engine.go
+index dcb81e8..a9649eb 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -19,6 +19,11 @@ type ImportOptions struct {
+ 	ImportOriginalGrids   bool
+ 	ImportOriginalCues    bool
+ 	PreserveOriginalPaths bool
++	// PathBase, if set, is the directory that Engine's relative track paths
++	// are resolved against instead of the import path. Use this when the
++	// database being read is a copy (see ImportSnapshot) so that track
++	// locations still point at the real music files.
++	PathBase string
+ }
+ 
+ type library struct {
+diff --git a/engine/importConvert.go b/engine/importConvert.go
+index 1d1d716..4c8aeb1 100644
+--- a/engine/importConvert.go
++++ b/engine/importConvert.go
+@@ -32,6 +32,9 @@ func importConvert(enLibrary library, path string, importOptions ImportOptions)
+ 
+ func importConvertSong(library *lib.Library, songsNull []songNull, path string, importOptions ImportOptions) error {
+ 	var err error
++	if importOptions.PathBase != "" {
++		path = importOptions.PathBase
++	}
+ 	for _, song := range songsNull {
+ 		var songPath string
+ 		if importOptions.PreserveOriginalPaths {
+@@ -75,7 +78,11 @@ func importConvertPerformanceData(library *lib.Library, perfData []performanceDa
+ 	}
+ 
+ 	for _, perfDataEntry := range perfData {
+-		song := songMap[perfDataEntry.id]
++		song, ok := songMap[perfDataEntry.id]
++		if !ok {
++			// performance data for a track that isn't in the Track table
++			continue
++		}
+ 
+ 		beatDataBlobComp := perfDataEntry.beatDataBlob
+ 		if beatDataBlobComp == nil {
+@@ -489,6 +496,11 @@ func loopsFromBlob(sampleRate float64, blob []byte) ([]lib.Loop, error) {
+ 
+ func fullPathFromRelativePath(basePath string, relativePath string) (string, error) {
+ 	// hard to test - platform-specific
++	// Engine stores paths with forward slashes; convert for the current OS
++	relativePath = filepath.FromSlash(relativePath)
++	if filepath.IsAbs(relativePath) {
++		return filepath.Clean(relativePath), nil
++	}
+ 	fullPath := filepath.Join(basePath, relativePath)
+ 	absolutePath, err := filepath.Abs(fullPath)
+ 	if err != nil {
+diff --git a/engine/importExtract.go b/engine/importExtract.go
+index e04214e..3bedf35 100644
+--- a/engine/importExtract.go
++++ b/engine/importExtract.go
+@@ -14,6 +14,10 @@ func importExtract(path string) (library, error) {
+ 	if err != nil {
+ 		return library{}, err
+ 	}
++	// close both databases when done; Windows cannot delete open files,
++	// which matters when importing from a temporary snapshot
++	defer m.Close()
++	defer hm.Close()
+ 	enLibrary.songs, err = importExtractTrack(m)
+ 	if err != nil {
+ 		return library{}, fmt.Errorf("error extracting track data: %v", err)
+@@ -53,15 +57,19 @@ func initDB(path string) (*sql.DB, *sql.DB, error) {
+ 		return nil, nil, fmt.Errorf("error opening m.db: %v", err)
+ 	}
+ 	if err = m.Ping(); err != nil {
++		m.Close()
+ 		return nil, nil, fmt.Errorf("error initializing m.db: %v", err)
+ 	}
+ 
+ 	// Open and ping the hm.db database
+ 	hm, err := sql.Open("sqlite3", hmPath)
+ 	if err != nil {
++		m.Close()
+ 		return nil, nil, fmt.Errorf("error opening hm.db: %v", err)
+ 	}
+ 	if err = hm.Ping(); err != nil {
++		m.Close()
++		hm.Close()
+ 		return nil, nil, fmt.Errorf("error initializing hm.db: %v", err)
+ 	}
+ 
+diff --git a/engine/snapshot.go b/engine/snapshot.go
+new file mode 100644
+index 0000000..02ed8c1
+--- /dev/null
++++ b/engine/snapshot.go
+@@ -0,0 +1,139 @@
++package engine
++
++import (
++	"database/sql"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++
++	"github.com/nateranda/djtools/lib"
++)
++
++// databaseFiles are the Engine database files djtools reads.
++var databaseFiles = []string{"m.db", "hm.db"}
++
++// sidecarSuffixes are SQLite companion files that may hold data not yet
++// written back into the main database file (write-ahead log, shared memory,
++// rollback journal). They are copied alongside the database if present.
++var sidecarSuffixes = []string{"-wal", "-shm", "-journal"}
++
++// ErrNotEngineLibrary is returned when a directory does not contain
++// Database2/m.db and Database2/hm.db.
++var ErrNotEngineLibrary = errors.New("not an Engine library: expected Database2/m.db and Database2/hm.db")
++
++// ValidateLibrary checks that path looks like an Engine library folder
++// without opening (and so without risking modifying) the database.
++func ValidateLibrary(path string) error {
++	for _, name := range databaseFiles {
++		info, err := os.Stat(filepath.Join(path, "Database2", name))
++		if err != nil || info.IsDir() {
++			return ErrNotEngineLibrary
++		}
++	}
++	return nil
++}
++
++// Snapshot copies the Engine database files at path (an "Engine Library"
++// folder) into a new temporary directory with the same Database2 layout,
++// and returns that directory. Music files are not copied. The caller is
++// responsible for removing the directory, for example with os.RemoveAll.
++func Snapshot(path string) (string, error) {
++	if err := ValidateLibrary(path); err != nil {
++		return "", err
++	}
++
++	tempDir, err := os.MkdirTemp("", "djtools-engine-*")
++	if err != nil {
++		return "", fmt.Errorf("error creating temporary directory: %v", err)
++	}
++	dstDir := filepath.Join(tempDir, "Database2")
++	if err := os.Mkdir(dstDir, 0o755); err != nil {
++		os.RemoveAll(tempDir)
++		return "", fmt.Errorf("error creating temporary directory: %v", err)
++	}
++
++	srcDir := filepath.Join(path, "Database2")
++	for _, name := range databaseFiles {
++		if err := copyFile(filepath.Join(srcDir, name), filepath.Join(dstDir, name)); err != nil {
++			os.RemoveAll(tempDir)
++			return "", err
++		}
++		for _, suffix := range sidecarSuffixes {
++			src := filepath.Join(srcDir, name+suffix)
++			if _, err := os.Stat(src); err != nil {
++				continue // sidecar not present
++			}
++			if err := copyFile(src, filepath.Join(dstDir, name+suffix)); err != nil {
++				os.RemoveAll(tempDir)
++				return "", err
++			}
++		}
++	}
++	return tempDir, nil
++}
++
++// ImportSnapshot copies the Engine library at path to a temporary location,
++// imports the copy, and removes the copy. The source database is only ever
++// read as a plain file, never opened by SQLite.
++//
++// Unless importOptions.PathBase is already set, relative track paths are
++// resolved against the original library location, not the temporary copy.
++func ImportSnapshot(path string, importOptions ImportOptions) (lib.Library, error) {
++	tempDir, err := Snapshot(path)
++	if err != nil {
++		return lib.Library{}, err
++	}
++	defer os.RemoveAll(tempDir)
++
++	if importOptions.PathBase == "" {
++		absPath, err := filepath.Abs(path)
++		if err != nil {
++			return lib.Library{}, err
++		}
++		importOptions.PathBase = absPath
++	}
++	return Import(tempDir, importOptions)
++}
++
++// SchemaVersion returns the Engine database schema version
++// ("major.minor.patch") recorded in m.db's Information table at path.
++// Only call this on a snapshot, never on a live library.
++func SchemaVersion(path string) (string, error) {
++	db, err := sql.Open("sqlite3", filepath.Join(path, "Database2", "m.db"))
++	if err != nil {
++		return "", err
++	}
++	defer db.Close()
++
++	var major, minor, patch int
++	err = db.QueryRow(`SELECT schemaVersionMajor, schemaVersionMinor, schemaVersionPatch
++		FROM Information ORDER BY id LIMIT 1`).Scan(&major, &minor, &patch)
++	if err != nil {
++		return "", fmt.Errorf("error reading schema version: %v", err)
++	}
++	return fmt.Sprintf("%d.%d.%d", major, minor, patch), nil
++}
++
++func copyFile(src, dst string) error {
++	in, err := os.Open(src)
++	if err != nil {
++		return fmt.Errorf("error opening %s: %v", src, err)
++	}
++	defer in.Close()
++
++	out, err := os.Create(dst)
++	if err != nil {
++		return fmt.Errorf("error creating %s: %v", dst, err)
++	}
++	if _, err := io.Copy(out, in); err != nil {
++		out.Close()
++		return fmt.Errorf("error copying %s: %v", src, err)
++	}
++	if err := out.Sync(); err != nil {
++		out.Close()
++		return fmt.Errorf("error copying %s: %v", src, err)
++	}
++	return out.Close()
++}
+diff --git a/engine/snapshot_test.go b/engine/snapshot_test.go
+new file mode 100644
+index 0000000..cabef41
+--- /dev/null
++++ b/engine/snapshot_test.go
+@@ -0,0 +1,46 @@
++package engine_test
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/nateranda/djtools/engine"
++)
++
++func TestSnapshotLeavesSourceUntouched(t *testing.T) {
++	src := generateDatabase(t, filepath.Join(fixturesDir, "nestedPlaylists"))
++	before, _ := os.ReadFile(filepath.Join(src, "Database2", "m.db"))
++
++	tmp, err := engine.Snapshot(src)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(tmp)
++	if v, err := engine.SchemaVersion(tmp); err != nil || v == "" {
++		t.Fatalf("schema version: %q %v", v, err)
++	}
++
++	lib, err := engine.ImportSnapshot(src, engine.ImportOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(lib.Playlists) == 0 {
++		t.Fatal("expected playlists")
++	}
++	for _, s := range lib.Songs {
++		if !filepath.IsAbs(s.Path) || filepath.Dir(filepath.Dir(s.Path)) != filepath.Dir(src) {
++			t.Fatalf("path %q not resolved against source %q", s.Path, src)
++		}
++	}
++	after, _ := os.ReadFile(filepath.Join(src, "Database2", "m.db"))
++	if string(before) != string(after) {
++		t.Fatal("source m.db changed")
++	}
++}
++
++func TestSnapshotRejectsNonLibrary(t *testing.T) {
++	if _, err := engine.Snapshot(t.TempDir()); err != engine.ErrNotEngineLibrary {
++		t.Fatalf("got %v", err)
++	}
++}
+diff --git a/lib/filter.go b/lib/filter.go
+new file mode 100644
+index 0000000..89b502b
+--- /dev/null
++++ b/lib/filter.go
+@@ -0,0 +1,89 @@
++package lib
++
++import "fmt"
++
++// FilterPlaylists returns a copy of the Library keeping only the playlists
++// whose PlaylistID is in keep. A playlist that is not itself selected but has
++// a selected descendant is kept as a folder: its own songs are dropped and
++// only the selected descendants remain under it. Songs are copied unchanged;
++// call PruneUnusedSongs on the result to drop songs no longer referenced.
++func (l *Library) FilterPlaylists(keep map[int]bool) Library {
++	return Library{
++		Songs:     append([]Song(nil), l.Songs...),
++		Playlists: filterPlaylists(l.Playlists, keep),
++	}
++}
++
++func filterPlaylists(playlists []Playlist, keep map[int]bool) []Playlist {
++	var out []Playlist
++	for _, p := range playlists {
++		children := filterPlaylists(p.SubPlaylists, keep)
++		selected := keep[p.PlaylistID]
++		if !selected && children == nil {
++			continue
++		}
++		np := Playlist{
++			PlaylistID:   p.PlaylistID,
++			Name:         p.Name,
++			SubPlaylists: children,
++		}
++		if selected {
++			np.Songs = append([]int(nil), p.Songs...)
++		}
++		out = append(out, np)
++	}
++	return out
++}
++
++// PruneUnusedSongs removes songs that are not referenced by any playlist.
++func (l *Library) PruneUnusedSongs() {
++	used := make(map[int]bool)
++	var walk func([]Playlist)
++	walk = func(playlists []Playlist) {
++		for _, p := range playlists {
++			for _, id := range p.Songs {
++				used[id] = true
++			}
++			walk(p.SubPlaylists)
++		}
++	}
++	walk(l.Playlists)
++
++	kept := make([]Song, 0, len(used))
++	for _, s := range l.Songs {
++		if used[s.SongID] {
++			kept = append(kept, s)
++		}
++	}
++	l.Songs = kept
++}
++
++// DedupePlaylistNames renames playlists that share a name with an earlier
++// sibling by appending " (2)", " (3)" and so on. Some software (Rekordbox,
++// for one) does not allow two playlists or folders with the same name at the
++// same level. It returns the number of playlists renamed.
++func (l *Library) DedupePlaylistNames() int {
++	return dedupeNames(l.Playlists)
++}
++
++func dedupeNames(playlists []Playlist) int {
++	renamed := 0
++	seen := make(map[string]bool)
++	for i := range playlists {
++		name := playlists[i].Name
++		if seen[name] {
++			for n := 2; ; n++ {
++				candidate := fmt.Sprintf("%s (%d)", playlists[i].Name, n)
++				if !seen[candidate] {
++					name = candidate
++					break
++				}
++			}
++			playlists[i].Name = name
++			renamed++
++		}
++		seen[name] = true
++		renamed += dedupeNames(playlists[i].SubPlaylists)
++	}
++	return renamed
++}
+diff --git a/lib/filter_test.go b/lib/filter_test.go
+new file mode 100644
+index 0000000..5e6d717
+--- /dev/null
++++ b/lib/filter_test.go
+@@ -0,0 +1,71 @@
++package lib
++
++import (
++	"reflect"
++	"testing"
++)
++
++func sampleLibrary() Library {
++	return Library{
++		Songs: []Song{{SongID: 1}, {SongID: 2}, {SongID: 3}, {SongID: 4}},
++		Playlists: []Playlist{
++			{PlaylistID: 1, Name: "House", Songs: []int{1}, SubPlaylists: []Playlist{
++				{PlaylistID: 2, Name: "Deep", Songs: []int{2}},
++				{PlaylistID: 3, Name: "Tech", Songs: []int{3}},
++			}},
++			{PlaylistID: 4, Name: "Other", Songs: []int{4}},
++		},
++	}
++}
++
++func TestFilterKeepsAncestorsAsFolders(t *testing.T) {
++	l := sampleLibrary()
++	out := l.FilterPlaylists(map[int]bool{3: true})
++	want := []Playlist{{PlaylistID: 1, Name: "House", SubPlaylists: []Playlist{
++		{PlaylistID: 3, Name: "Tech", Songs: []int{3}},
++	}}}
++	if !reflect.DeepEqual(out.Playlists, want) {
++		t.Fatalf("got %+v", out.Playlists)
++	}
++	out.PruneUnusedSongs()
++	if len(out.Songs) != 1 || out.Songs[0].SongID != 3 {
++		t.Fatalf("prune: got %+v", out.Songs)
++	}
++	// original untouched
++	if len(l.Playlists) != 2 || len(l.Songs) != 4 {
++		t.Fatal("source library was modified")
++	}
++}
++
++func TestFilterNothingSelected(t *testing.T) {
++	l := sampleLibrary()
++	out := l.FilterPlaylists(map[int]bool{})
++	if out.Playlists != nil {
++		t.Fatalf("expected no playlists, got %+v", out.Playlists)
++	}
++}
++
++func TestDedupe(t *testing.T) {
++	l := Library{Playlists: []Playlist{
++		{Name: "A"}, {Name: "A"}, {Name: "B", SubPlaylists: []Playlist{{Name: "x"}, {Name: "x"}}}, {Name: "A"},
++	}}
++	if n := l.DedupePlaylistNames(); n != 3 {
++		t.Fatalf("renamed %d, want 3", n)
++	}
++	got := []string{l.Playlists[0].Name, l.Playlists[1].Name, l.Playlists[3].Name, l.Playlists[2].SubPlaylists[1].Name}
++	want := []string{"A", "A (2)", "A (3)", "x (2)"}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("got %v", got)
++	}
++}
++
++func TestCheckCorruptedSongsAdjacent(t *testing.T) {
++	l := Library{
++		Songs:     []Song{{SongID: 1}, {SongID: 2, Corrupt: true}, {SongID: 3, Corrupt: true}},
++		Playlists: []Playlist{{Name: "p", Songs: []int{1, 2, 3}}},
++	}
++	l.CheckCorruptedSongs()
++	if len(l.Songs) != 1 || l.Songs[0].SongID != 1 || !reflect.DeepEqual(l.Playlists[0].Songs, []int{1}) {
++		t.Fatalf("got %+v %+v", l.Songs, l.Playlists)
++	}
++}
+diff --git a/lib/library.go b/lib/library.go
+index 67c9745..d5bd9f2 100644
+--- a/lib/library.go
++++ b/lib/library.go
+@@ -138,17 +138,17 @@ func (l *Library) SortSongs() {
+ 
+ // CheckCorruptedSongs removes songs marked as corrupted from the Library
+ func (l *Library) CheckCorruptedSongs() {
+-	for i, song := range l.Songs {
+-		// this is expensive, but it should happen rarely so it's ok
++	// build a new slice rather than removing while ranging, which could skip
++	// songs or index past the end of the shrunken slice
++	kept := l.Songs[:0]
++	for _, song := range l.Songs {
+ 		if song.Corrupt {
+-			// remove song from library.Songs (doesn't preserve order)
+-			l.Songs[i] = l.Songs[len(l.Songs)-1]
+-			l.Songs = l.Songs[:len(l.Songs)-1]
+-
+-			// remove song from playlists
+ 			l.Playlists = removeSongFromPlaylists(l.Playlists, song.SongID)
++			continue
+ 		}
++		kept = append(kept, song)
+ 	}
++	l.Songs = kept
+ }
+ 
+ func removeSongFromPlaylists(playlists []Playlist, songID int) []Playlist {
+diff --git a/rbxml/exportConvert.go b/rbxml/exportConvert.go
+index b2e5ca8..a1f5554 100644
+--- a/rbxml/exportConvert.go
++++ b/rbxml/exportConvert.go
+@@ -25,6 +25,11 @@ func unixToDate(date int, options ExportOptions) string {
+ func pathToURI(path string) string {
+ 	// this is a jank fix, replace with something more robust?
+ 	uriPath := filepath.ToSlash(path)
++	// absolute Unix/macOS paths start with "/", which would otherwise give
++	// "file://localhost//Users/..."; UNC paths ("//server/share") are left alone
++	if strings.HasPrefix(uriPath, "/") && !strings.HasPrefix(uriPath, "//") {
++		uriPath = uriPath[1:]
++	}
+ 	uriPath = url.PathEscape(uriPath)
+ 	uriPath = strings.ReplaceAll(uriPath, "%2F", "/") // keep slashes
+ 	return "file://localhost/" + uriPath
+diff --git a/rbxml/uri_test.go b/rbxml/uri_test.go
+new file mode 100644
+index 0000000..e681bf4
+--- /dev/null
++++ b/rbxml/uri_test.go
+@@ -0,0 +1,21 @@
++package rbxml
++
++import (
++	"runtime"
++	"testing"
++)
++
++func TestPathToURIAbsoluteUnix(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("unix path test")
++	}
++	got := pathToURI("/Users/tom/Music/A & B.mp3")
++	want := "file://localhost/Users/tom/Music/A%20&%20B.mp3"
++	if got != want {
++		t.Fatalf("got %q want %q", got, want)
++	}
++	back, err := uriToPath(got)
++	if err != nil || back != "/Users/tom/Music/A & B.mp3" {
++		t.Fatalf("round trip got %q %v", back, err)
++	}
++}
+-- 
+2.43.0
+

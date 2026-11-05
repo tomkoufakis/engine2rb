@@ -1,0 +1,6 @@
+.DS_Store
+databases/
+tmp/
+.vscode/
+__debug_*
+test.go

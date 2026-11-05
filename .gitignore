@@ -1,0 +1,4 @@
+/dist/
+*.app
+*.exe
+cmd/engine2rb/engine2rb
