@@ -168,48 +168,56 @@ func exportConvertGrid(song *lib.Song) []tempo {
 	return tempos
 }
 
+// exportConvertSubPlaylists converts a playlist (and its sub-playlists) to
+// Rekordbox nodes. A Rekordbox node is either a playlist (tracks) or a folder
+// (child nodes), never both. A playlist that has tracks AND sub-playlists is
+// therefore exported as a folder with the playlist's name that contains a
+// "<name> (tracks)" playlist followed by the sub-playlists, which keeps the
+// original nesting intact.
 func exportConvertSubPlaylists(playlist lib.Playlist) []node {
-	var nodes []node
-
-	// add playlist node containing tracks
+	var trackNode *node
 	if playlist.Songs != nil {
 		var tracks []nodeTrack
 		for _, id := range playlist.Songs {
 			tracks = append(tracks, nodeTrack{Id: int32(id)})
 		}
-		nodes = append(nodes, node{
+		trackNode = &node{
 			NodeType: 1,
 			Name:     playlist.Name,
 			Entries:  int32(len(playlist.Songs)),
 			Tracks:   &tracks,
-		})
+		}
 	}
 
-	// add folder node containing sub-playlists
-	if playlist.SubPlaylists != nil {
-		var subNodes []node
-		// add sub-playlist nodes recursively
-		for _, playlist := range playlist.SubPlaylists {
-			subNodes = slices.Concat(subNodes, exportConvertSubPlaylists(playlist))
+	if playlist.SubPlaylists == nil {
+		if trackNode == nil {
+			return nil
 		}
-		// add '_folder' to playlist name if it contains songs
-		// to differentiate it from the actual playlist
-		var name string
-		if playlist.Songs != nil {
-			name = playlist.Name + "_folder"
-		} else {
-			name = playlist.Name
-		}
-
-		nodes = append(nodes, node{
-			NodeType: 0,
-			Name:     name,
-			Count:    int32(len(playlist.SubPlaylists)),
-			Nodes:    &subNodes,
-		})
+		return []node{*trackNode}
 	}
 
-	return nodes
+	var subNodes []node
+	for _, sub := range playlist.SubPlaylists {
+		subNodes = slices.Concat(subNodes, exportConvertSubPlaylists(sub))
+	}
+
+	// nothing below this playlist made it into the export: plain playlist
+	if trackNode != nil && len(subNodes) == 0 {
+		return []node{*trackNode}
+	}
+
+	name := playlist.Name
+	if trackNode != nil {
+		trackNode.Name = playlist.Name + " (tracks)"
+		subNodes = slices.Concat([]node{*trackNode}, subNodes)
+	}
+
+	return []node{{
+		NodeType: 0,
+		Name:     name,
+		Count:    int32(len(subNodes)),
+		Nodes:    &subNodes,
+	}}
 }
 
 func exportConvertPlaylist(library *lib.Library) node {
