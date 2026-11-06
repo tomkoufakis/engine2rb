@@ -34,6 +34,7 @@ func importExtract(path string) (library, error) {
 	if err != nil {
 		return library{}, fmt.Errorf("error extracting playlists: %v", err)
 	}
+	enLibrary.databaseUuid = importExtractDatabaseUuid(m)
 	enLibrary.playlistEntityList, err = importExtractPlaylistEntity(m)
 	if err != nil {
 		return library{}, fmt.Errorf("error extracting playlist data: %v", err)
@@ -124,13 +125,33 @@ func importExtractPlaylist(db *sql.DB) ([]playlist, error) {
 	})
 }
 
+// importExtractDatabaseUuid returns the uuid identifying this Engine library,
+// or "" if it cannot be read (older schemas).
+func importExtractDatabaseUuid(db *sql.DB) string {
+	var uuid sql.NullString
+	if err := db.QueryRow(`SELECT uuid FROM Information LIMIT 1`).Scan(&uuid); err != nil {
+		return ""
+	}
+	return uuid.String
+}
+
 func importExtractPlaylistEntity(db *sql.DB) ([]playlistEntity, error) {
-	query := `SELECT id, listId, trackId, nextEntityId FROM PlaylistEntity ORDER BY listId`
+	// PlaylistEntity.databaseUuid says which library a track belongs to;
+	// older schemas do not have the column
+	uuidColumn := "''"
+	var hasUuid int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('PlaylistEntity')
+		WHERE name = 'databaseUuid'`).Scan(&hasUuid); err == nil && hasUuid > 0 {
+		uuidColumn = "COALESCE(databaseUuid, '')"
+	}
+	query := `SELECT id, listId, trackId, nextEntityId, ` + uuidColumn + `
+		FROM PlaylistEntity ORDER BY listId`
 
 	return queryAndScanRows(db, query, func(r *sql.Rows) (playlistEntity, error) {
 		var playlistEntity playlistEntity
 		err := r.Scan(&playlistEntity.id, &playlistEntity.listId,
-			&playlistEntity.trackId, &playlistEntity.nextEntityId)
+			&playlistEntity.trackId, &playlistEntity.nextEntityId,
+			&playlistEntity.databaseUuid)
 		return playlistEntity, err
 	})
 }

@@ -74,6 +74,10 @@ type Playlist struct {
 	Name         string     // name of playlist
 	Songs        []int      // slice of song ids in order
 	SubPlaylists []Playlist // slice of child playlists in order, can be recursive
+
+	// UnresolvedTracks counts playlist entries that could not be imported
+	// because the track belongs to another library or no longer exists.
+	UnresolvedTracks int `json:",omitempty"`
 }
 
 // Library is the entire library of a DJ software.

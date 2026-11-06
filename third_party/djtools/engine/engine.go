@@ -33,6 +33,7 @@ type library struct {
 	playlists          []playlist
 	playlistEntityList []playlistEntity
 	smartlistList      []smartlist
+	databaseUuid       string // uuid of this library, "" if unknown
 }
 
 type songNull struct {
@@ -77,6 +78,7 @@ type playlist struct {
 	parentListId int
 	nextListId   int
 	songs        []int
+	unresolved   int // entries whose track is not in this library
 }
 
 type playlistEntity struct {
@@ -84,6 +86,7 @@ type playlistEntity struct {
 	listId       int
 	trackId      int
 	nextEntityId int
+	databaseUuid string // library the track belongs to, "" if unknown
 }
 
 type smartlist struct {

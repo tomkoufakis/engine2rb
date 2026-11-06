@@ -20,7 +20,7 @@ func importConvert(enLibrary library, path string, importOptions ImportOptions) 
 		return lib.Library{}, err
 	}
 	importConvertHistory(&library, enLibrary.songHistoryList)
-	err = importConvertPlaylist(&library, enLibrary.playlists, enLibrary.playlistEntityList)
+	err = importConvertPlaylist(&library, enLibrary.playlists, enLibrary.playlistEntityList, enLibrary.databaseUuid)
 	if err != nil {
 		return lib.Library{}, err
 	}
@@ -156,12 +156,18 @@ func importConvertHistory(library *lib.Library, songHistoryList []songHistory) {
 	}
 }
 
-func importConvertPlaylist(library *lib.Library, playlists []playlist, playlistEntityList []playlistEntity) error {
+func importConvertPlaylist(library *lib.Library, playlists []playlist, playlistEntityList []playlistEntity, databaseUuid string) error {
 	if playlists == nil {
 		return nil
 	}
 
-	playlists, err := populatePlaylists(playlistEntityList, playlists)
+	knownSongs := make(map[int]struct{}, len(library.Songs))
+	for _, song := range library.Songs {
+		knownSongs[song.SongID] = struct{}{}
+	}
+	resolver := trackResolver{databaseUuid: databaseUuid, known: knownSongs}
+
+	playlists, err := populatePlaylists(playlistEntityList, playlists, resolver)
 	if err != nil {
 		return err
 	}
@@ -188,9 +194,10 @@ func importConvertPlaylist(library *lib.Library, playlists []playlist, playlistE
 	// move parent playlists to Library
 	for _, playlist := range parentPlaylists {
 		newPlaylist := lib.Playlist{
-			Name:       playlist.title,
-			PlaylistID: playlist.id,
-			Songs:      playlist.songs,
+			Name:             playlist.title,
+			PlaylistID:       playlist.id,
+			Songs:            playlist.songs,
+			UnresolvedTracks: playlist.unresolved,
 		}
 
 		library.Playlists = append(library.Playlists, newPlaylist)
@@ -233,9 +240,10 @@ func importConvertPlaylist(library *lib.Library, playlists []playlist, playlistE
 		// move new 'parent' playlists to library
 		for _, playlist := range parentPlaylistsNew {
 			newPlaylist := lib.Playlist{
-				Name:       playlist.title,
-				PlaylistID: playlist.id,
-				Songs:      playlist.songs,
+				Name:             playlist.title,
+				PlaylistID:       playlist.id,
+				Songs:            playlist.songs,
+				UnresolvedTracks: playlist.unresolved,
 			}
 			parentPlaylist := parentPlaylistAddressMap[playlist.parentListId]
 			parentPlaylist.SubPlaylists = append(parentPlaylist.SubPlaylists, newPlaylist)
@@ -253,7 +261,26 @@ func importConvertPlaylist(library *lib.Library, playlists []playlist, playlistE
 	return nil
 }
 
-func populatePlaylists(playlistEntityList []playlistEntity, playlists []playlist) ([]playlist, error) {
+// trackResolver decides whether a playlist entry refers to a track that is
+// part of this library. Engine playlists can hold tracks from other libraries
+// (identified by databaseUuid, e.g. external drives) and entries for tracks
+// that no longer exist; neither can be exported from this library, and a
+// foreign trackId must not be looked up here because it may match an
+// unrelated local track.
+type trackResolver struct {
+	databaseUuid string
+	known        map[int]struct{}
+}
+
+func (r trackResolver) resolves(e playlistEntity) bool {
+	if r.databaseUuid != "" && e.databaseUuid != "" && e.databaseUuid != r.databaseUuid {
+		return false
+	}
+	_, ok := r.known[e.trackId]
+	return ok
+}
+
+func populatePlaylists(playlistEntityList []playlistEntity, playlists []playlist, resolver trackResolver) ([]playlist, error) {
 	playlistMap := make(map[int]int)
 	for i, playlist := range playlists {
 		playlistMap[playlist.id] = i
@@ -271,19 +298,29 @@ func populatePlaylists(playlistEntityList []playlistEntity, playlists []playlist
 
 	for _, track := range firstSongs {
 		// add first song
-		trackId := track.trackId
 		listId := track.listId
 		nextEntityId := track.nextEntityId
-		playlists[playlistMap[listId]].songs = append(playlists[playlistMap[listId]].songs, trackId)
+		pl := &playlists[playlistMap[listId]]
+		add := func(e playlistEntity) {
+			if resolver.resolves(e) {
+				pl.songs = append(pl.songs, e.trackId)
+			} else {
+				pl.unresolved++
+			}
+		}
+		add(track)
 
 		// iterate through playlist, adding songs in order until last song
 		for range len(playlistEntityList) { // failsafe in case there is no last song
 			if nextEntityId == 0 {
 				break
 			}
-			trackId = playlistEntityMap[nextEntityId].trackId
-			nextEntityId = playlistEntityMap[nextEntityId].nextEntityId
-			playlists[playlistMap[listId]].songs = append(playlists[playlistMap[listId]].songs, trackId)
+			next, ok := playlistEntityMap[nextEntityId]
+			if !ok {
+				break
+			}
+			add(*next)
+			nextEntityId = next.nextEntityId
 		}
 	}
 

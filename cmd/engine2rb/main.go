@@ -198,12 +198,20 @@ func (u *ui) setLibrary(l *convert.Loaded) {
 	u.names = map[string]string{}
 	u.checked = map[string]bool{}
 
+	partial, unresolved := 0, 0
 	var add func(parent string, playlists []lib.Playlist)
 	add = func(parent string, playlists []lib.Playlist) {
 		for _, p := range playlists {
 			id := strconv.Itoa(p.PlaylistID)
 			u.children[parent] = append(u.children[parent], id)
-			u.names[id] = fmt.Sprintf("%s  (%d)", p.Name, len(p.Songs))
+			if p.UnresolvedTracks > 0 {
+				// some entries point to tracks that are not in this library
+				u.names[id] = fmt.Sprintf("%s  (%d of %d)", p.Name, len(p.Songs), len(p.Songs)+p.UnresolvedTracks)
+				partial++
+				unresolved += p.UnresolvedTracks
+			} else {
+				u.names[id] = fmt.Sprintf("%s  (%d)", p.Name, len(p.Songs))
+			}
 			add(id, p.SubPlaylists)
 		}
 	}
@@ -215,6 +223,11 @@ func (u *ui) setLibrary(l *convert.Loaded) {
 	}
 	u.logf("Loaded %d tracks and %d playlists (Engine database schema %s).",
 		len(l.Library.Songs), len(u.names), schema)
+	if unresolved > 0 {
+		u.logf("%d playlist(s) reference %d track(s) that are not in this library "+
+			"(tracks from another library or deleted tracks); these are skipped. "+
+			"Such playlists show \"found of total\" counts.", partial, unresolved)
+	}
 	if len(u.names) == 0 {
 		u.logf("No playlists found. Smart playlists (smartlists) are not converted by djtools.")
 	}
