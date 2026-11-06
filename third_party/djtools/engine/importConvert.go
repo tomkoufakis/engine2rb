@@ -290,40 +290,67 @@ func populatePlaylists(playlistEntityList []playlistEntity, playlists []playlist
 	return playlists, nil
 }
 
+// sortPlaylists orders playlists by their nextListId chains. The input may mix
+// several sibling groups (different parentListId); each group is sorted on its
+// own and the groups are returned in order of first appearance. The function
+// tolerates inconsistent data (no head, cycles, links to missing siblings) by
+// appending any playlists not reachable from a chain head in ascending id
+// order, so a damaged chain never aborts the whole import.
 func sortPlaylists(playlists []playlist) ([]playlist, error) {
-
-	i, err := findFirstPlaylist(playlists)
-	if err != nil {
-		return nil, fmt.Errorf("error sorting playlist: %v", err)
+	var parentOrder []int
+	groups := make(map[int][]playlist)
+	for _, p := range playlists {
+		if _, seen := groups[p.parentListId]; !seen {
+			parentOrder = append(parentOrder, p.parentListId)
+		}
+		groups[p.parentListId] = append(groups[p.parentListId], p)
 	}
 
-	playlistMap := make(map[int]int)
-	for j, playlist := range playlists {
-		playlistMap[playlist.id] = j
+	sorted := make([]playlist, 0, len(playlists))
+	for _, parentId := range parentOrder {
+		sorted = append(sorted, sortSiblings(groups[parentId])...)
 	}
-	var playlistsSorted []playlist
-	for range playlists {
-		playlistsSorted = append(playlistsSorted, playlists[playlistMap[i]])
-		i = playlists[playlistMap[i]].nextListId
-	}
-	return playlistsSorted, nil
+	return sorted, nil
 }
 
-func findFirstPlaylist(playlists []playlist) (int, error) {
-	nextListIdMap := make(map[int]struct{})
-	for _, playlist := range playlists {
-		if playlist.nextListId != 0 {
-			nextListIdMap[playlist.nextListId] = struct{}{}
+func sortSiblings(siblings []playlist) []playlist {
+	byId := make(map[int]int, len(siblings))
+	referenced := make(map[int]struct{}, len(siblings))
+	for i, p := range siblings {
+		byId[p.id] = i
+		if p.nextListId != 0 {
+			referenced[p.nextListId] = struct{}{}
 		}
 	}
 
-	// select the playlist that is not referred to by any other playlist's nextListId
-	for _, playlist := range playlists {
-		if _, exists := nextListIdMap[playlist.id]; !exists {
-			return playlist.id, nil
+	sorted := make([]playlist, 0, len(siblings))
+	visited := make(map[int]struct{}, len(siblings))
+	walk := func(id int) {
+		for id != 0 {
+			idx, ok := byId[id]
+			if !ok {
+				return
+			}
+			if _, done := visited[id]; done {
+				return
+			}
+			visited[id] = struct{}{}
+			sorted = append(sorted, siblings[idx])
+			id = siblings[idx].nextListId
 		}
 	}
-	return 0, fmt.Errorf("NotFoundError: did not find the first playlist")
+
+	// chains start at playlists that no sibling points to
+	for _, p := range siblings {
+		if _, ok := referenced[p.id]; !ok {
+			walk(p.id)
+		}
+	}
+	// leftovers (cycles or broken chains): keep them, in id order
+	for _, p := range siblings {
+		walk(p.id)
+	}
+	return sorted
 }
 
 func findFirstSongs(playlistEntityList []playlistEntity) ([]playlistEntity, error) {
