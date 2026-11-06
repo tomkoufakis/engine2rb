@@ -3,4 +3,4 @@ databases/
 tmp/
 .vscode/
 __debug_*
-test.go
+/test.go
